@@ -1,0 +1,3 @@
+<launch>
+    <node pkg="localization" type="localization_node.py" name="factor_localization" output="screen"/>
+</launch>
