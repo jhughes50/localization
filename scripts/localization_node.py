@@ -12,4 +12,5 @@ if __name__ == "__main__":
     rospy.init_node("factor_localizer")
     node = FactorGraphNode()
 
-    rospy.spin()
+    node.spin()
+    

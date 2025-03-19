@@ -2,7 +2,7 @@ import gtsam
 import numpy as np
 import utm
 from gtsam.symbol_shorthand import B, V, X
-
+from typing import Tuple
 
 def vector3(x, y, z) -> np.ndarray:
     """Create 3d double numpy array."""
@@ -42,7 +42,7 @@ class FactorManager():
 
         self.gravity_vec = np.array([0., 0., self.config["gravity"]])
         self.bias_estimate_vec = np.zeros((self.config["bias_num_measurements"], 6))
-        self.init_counter = 0.
+        self.init_counter = 0
         self.imu2body = self.config["T_imu2body"]
         
         # All _ variables are private
@@ -68,15 +68,18 @@ class FactorManager():
         self._parameters.relinearizeSkip = 1
         self._isam = gtsam.ISAM2(self._parameters)
 
+        self.optimized_pose=gtsam.Pose3()
+        self.last_velocity = gtsam.Point3(0,0,0)
+
         print("Factor Manager Initialized")
 
     @staticmethod
     def defaultParams(g: float):
         """Create default parameters with Z *up* """
         # TODO some problem here
-        params = gtsam.PreintegrationParams.MakeSharedU(g)
+        params = gtsam.PreintegrationCombinedParams.MakeSharedU(g)
         kGyroSigma = np.radians(0.5) / 60  # 0.5 degree ARW
-        kAccelSigma = 0.1 / 60  # 10 cm VRW
+        kAccelSigma = 0.1 #/ 60  # 10 cm VRW
         I = np.eye(3)
         params.setGyroscopeCovariance(kGyroSigma**2 * I) # PROBLEM IS HERE TODO fix this
         params.setAccelerometerCovariance(kAccelSigma**2 * I)
@@ -88,18 +91,18 @@ class FactorManager():
                        gyro_meas: np.ndarray, orient: np.ndarray) -> None:
         if self.init_counter < self.config["bias_num_measurements"]:
             self.bias_estimate_vec[self.init_counter, :3] = \
-                self.imu2body @ accel_meas - self.gravity_vec
+                self.imu2body @ accel_meas + self.gravity_vec
             self.bias_estimate_vec[self.init_counter, 3:] = \
                 self.imu2body @ gyro_meas
             self.init_counter += 1
 
         if self.init_counter == self.config["bias_num_measurements"]:
-            self.bias = np.mean(self.bias_estimate_vec, axis=1)
+            self.bias = np.mean(self.bias_estimate_vec, axis=0)
             self.bias = \
                 gtsam.imuBias.ConstantBias(self.bias[:3], self.bias[3:])
             self.pim = \
                 gtsam.PreintegratedCombinedMeasurements(self.params, self.bias)
-
+            
             # GTSAM expects quaternion as w,x,y,z
             self.initial_orientation = self.imu2body @ gtsam.Rot3(orient[0],
                                                                   orient[1],
@@ -112,8 +115,11 @@ class FactorManager():
     def add_gps_factor(self, timestamp: int, gps: np.array) -> None:
         if not self._initialized:
             return
+        
         meas = np.zeros(3)
-        meas = np.array(utm.from_latlon(gps[0], gps[1])[0])
+        meas[:2] = np.array(utm.from_latlon(gps[0], gps[1])[:2])
+        meas[2] = gps[2]
+        print(meas)
         if self._key_index == 0:
             self.navstate_pose = \
                     gtsam.Pose3(self.initial_orientation,
@@ -121,13 +127,16 @@ class FactorManager():
                                           meas[1],
                                           meas[2]]))
             self.init_navstate = \
-                gtsam.NavState(self.navstate_pose, gtsam.Point3(), self.bias)
+                gtsam.NavState(self.navstate_pose, gtsam.Point3(0,0,0))#, self.bias)
             self.lastNavState = self.init_navstate
             self._initials.insert(X(self._key_index), self.navstate_pose)
-            self._initials.insert(V(self._key_index), gtsam.Point3())
+            self._initials.insert(V(self._key_index), gtsam.Point3(0,0,0))
             self._initials.insert(B(self._key_index), self.bias)
+            self._graph.add(gtsam.PriorFactorPose3(X(self._key_index), self.navstate_pose, gtsam.noiseModel.Isotropic.Sigma(6, 0.001)))
+            self._graph.add(gtsam.PriorFactorPoint3(V(self._key_index), gtsam.Point3(0,0,0), gtsam.noiseModel.Isotropic.Sigma(3, 0.001)))
+            self._graph.add(gtsam.PriorFactorConstantBias(B(self._key_index), self.bias, gtsam.noiseModel.Isotropic.Sigma(6, 0.001)))
 
-        self._graph.add(gtsam.GPSFactor(self._key_index,
+        self._graph.add(gtsam.GPSFactor(X(self._key_index),
                                         meas, self._gps_noise))
         if self._key_index > 0:
             self._graph.add(gtsam.CombinedImuFactor(X(self._key_index),
@@ -137,6 +146,10 @@ class FactorManager():
                                                     B(self._key_index),
                                                     B(self._key_index-1),
                                                     self.pim))
+            self._graph.add(gtsam.PriorFactorPose3(X(self._key_index), self.navstate_pose, gtsam.noiseModel.Isotropic.Sigma(6, 1e-9)))
+            self._initials.insert(X(self._key_index), self.optimized_pose)
+            self._initials.insert(V(self._key_index), self.last_velocity)
+            self._initials.insert(B(self._key_index), self.bias)
 
         self._key_index += 1
 
@@ -166,8 +179,10 @@ class FactorManager():
         accel_meas = self.imu2body @ accel
         gyro_meas = self.imu2body @ gyro
         dT = nanosecInt2Float(timestamp) - self._lastImuTime
+        if dT < 0:
+            return 
         self.pim.integrateMeasurement(accel_meas, gyro_meas, dT)
-        self._lastImuTime
+        self._lastImuTime = nanosecInt2Float(timestamp)
 
     def initialize_graph(self) -> None:
         if not self._initialized:
@@ -177,25 +192,28 @@ class FactorManager():
     def optimize(self) -> gtsam.Values:
         if not self._initialized:
             return None
+        
         self._optimizer = gtsam.GaussNewtonOptimizer(self._graph,
                                                      self._initials,
                                                      self._params)
         result = self._optimizer.optimize()
-        print("\nFinal:{}".format(result))
+        #print("\nFinal:{}".format(result))
         return result
 
     # Main call loop
     def runner(self) -> Tuple[np.ndarray, np.ndarray]:
         if not self._initialized:
-            return None
-        self.initialize_graph()
+            return None, None
+        #self.initialize_graph()
         result = self.optimize()
         self.pim.resetIntegration()
 
-        optimized_pose = result.atPose3(self._key_index) 
+        optimized_pose = result.atPose3(X(self._key_index-1))
+        self.optimized_pose = optimized_pose
         rotation = optimized_pose.rotation()
-        translation = optimized_pose.translation().vector()
-        quaternion = rotation.quaternion()
+        translation = optimized_pose.translation()
+        self.last_velocity = result.atPoint3(V(self._key_index-1))
+        quat = rotation.toQuaternion()
         quaternion = np.array([quat.x(), quat.y(), quat.z(), quat.w()])
 
         return translation, quaternion

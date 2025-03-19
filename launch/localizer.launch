@@ -1,3 +1,6 @@
 <launch>
-    <node pkg="localization" type="localization_node.py" name="factor_localization" output="screen"/>
+    <node pkg="localization" type="localization_node.py" name="factor_localization" output="screen">
+        <remap from="/gps" to="/mavros/global_position/raw/fix"/>
+        <remap from="/imu" to="/mavros/imu/data/raw"/>
+    </node>
 </launch>
